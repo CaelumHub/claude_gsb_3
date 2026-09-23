@@ -5,6 +5,7 @@ LTTB (Largest Triangle Three Buckets) Downsampling Algorithm
 - Configurable target point count
 """
 
+import json
 import math
 from typing import List, Dict, Tuple
 
@@ -173,6 +174,97 @@ def lttb_downsample_adaptive(data: List[Dict], target_points: int,
 
     sampled.append(data[-1])
     return sampled
+
+
+def _series_key(point: Dict) -> Tuple[str, str]:
+    """Return the source/tags identity of a point."""
+    raw_tags = point.get("tags") or {}
+    tags = {
+        str(key): str(value)
+        for key, value in raw_tags.items()
+        if value is not None
+    }
+    tag_key = json.dumps(tags, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False)
+    return str(point.get("src", "default")), tag_key
+
+
+def _downsample_one_series(points: List[Dict], target_points: int,
+                           method: str) -> List[Dict]:
+    """Downsample one sorted series, including support for 1-2 target points."""
+    if target_points >= len(points) or target_points <= 0:
+        return points
+    if target_points == 1:
+        return [points[0]]
+    if target_points == 2:
+        return [points[0], points[-1]]
+    return downsample_simple(points, target_points, method)
+
+
+def downsample_by_series(data: List[Dict], target_points: int,
+                         method: str = "lttb") -> List[Dict]:
+    """
+    Downsample each source/tag series independently.
+
+    Timestamps selected for any series are kept for every series, so when two
+    sources report the same timestamp neither value is silently removed just
+    because the flat point list was thinned.
+    """
+    if not data or target_points <= 0:
+        return []
+
+    groups: Dict[Tuple[str, str], List[Dict]] = {}
+    for point in data:
+        groups.setdefault(_series_key(point), []).append(point)
+
+    sorted_groups = [
+        sorted(group, key=lambda p: p["t"])
+        for _, group in sorted(groups.items(), key=lambda item: item[0])
+    ]
+    group_count = len(sorted_groups)
+
+    # Every distinct series needs at least one representative point.
+    # Remaining capacity is allocated to longer series.
+    quotas = [1] * group_count
+    remaining = max(0, target_points - group_count)
+    if remaining:
+        weights = [max(0, len(group) - 1) for group in sorted_groups]
+        total_weight = sum(weights)
+        if total_weight:
+            allocated = [weight * remaining // total_weight for weight in weights]
+            for index, value in enumerate(allocated):
+                quotas[index] += min(value, max(0, len(sorted_groups[index]) - 1))
+
+            leftover = remaining - sum(
+                min(value, max(0, len(group) - 1))
+                for value, group in zip(allocated, sorted_groups)
+            )
+            order = sorted(
+                range(group_count),
+                key=lambda index: len(sorted_groups[index]),
+                reverse=True
+            )
+            while leftover > 0:
+                progressed = False
+                for index in order:
+                    if quotas[index] < len(sorted_groups[index]):
+                        quotas[index] += 1
+                        leftover -= 1
+                        progressed = True
+                        if leftover == 0:
+                            break
+                if not progressed:
+                    break
+
+    selected_timestamps = set()
+    for group, quota in zip(sorted_groups, quotas):
+        sampled = _downsample_one_series(group, quota, method)
+        selected_timestamps.update(point["t"] for point in sampled)
+
+    return sorted(
+        (point for point in data if point["t"] in selected_timestamps),
+        key=lambda p: (p["t"],) + _series_key(p)
+    )
 
 
 def downsample_simple(data: List[Dict], target_points: int,

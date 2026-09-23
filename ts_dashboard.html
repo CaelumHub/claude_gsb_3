@@ -1964,12 +1964,44 @@ async function queryHistory() {
   showToast(`查询完成: ${data.downsampled_count} 点`, 'success');
 }
 
+function historySeriesKey(p) {
+  const tags = Object.fromEntries(Object.entries(p.tags || {}).sort(([a], [b]) => a.localeCompare(b)));
+  return JSON.stringify([p.src || 'default', tags]);
+}
+
+function historySeriesName(p) {
+  const source = p.src || 'default';
+  const tags = Object.entries(p.tags || {})
+    .map(([key, value]) => `${key}=${value}`)
+    .join(', ');
+  return tags ? `${source} · ${tags}` : source;
+}
+
 function renderHistoryChart(data, metric) {
   if (!historyChartInstance) return;
 
-  const points = (data.data || []).map(p => [p.t * 1000, p.v]);
+  const groups = new Map();
+  (data.data || []).forEach(p => {
+    const key = historySeriesKey(p);
+    if (!groups.has(key)) {
+      groups.set(key, { name: historySeriesName(p), points: [] });
+    }
+    groups.get(key).points.push([p.t * 1000, p.v]);
+  });
+
+  const seriesNames = [...groups.values()].map(group => group.name);
+  const series = [...groups.values()].map(group => ({
+    name: group.name,
+    type: 'line',
+    smooth: true,
+    symbol: 'none',
+    lineStyle: { width: 2 },
+    emphasis: { focus: 'series' },
+    data: group.points,
+  }));
 
   historyChartInstance.setOption({
+    color: ['#3b82f6', '#22c55e', '#f59e0b', '#a855f7', '#06b6d4', '#ef4444', '#ec4899', '#84cc16'],
     tooltip: {
       trigger: 'axis',
       backgroundColor: 'rgba(15,23,42,0.95)',
@@ -1977,11 +2009,12 @@ function renderHistoryChart(data, metric) {
       textStyle: { color: '#e2e8f0', fontSize: 11, fontFamily: 'JetBrains Mono' },
     },
     legend: {
-      data: [metric],
+      type: 'scroll',
+      data: seriesNames,
       top: 0,
       textStyle: { color: '#94a3b8', fontSize: 11, fontFamily: 'JetBrains Mono' },
     },
-    grid: { left: 50, right: 20, top: 30, bottom: 30 },
+    grid: { left: 50, right: 20, top: 45, bottom: 30 },
     xAxis: {
       type: 'time',
       axisLine: { lineStyle: { color: '#1e2d42' } },
@@ -1990,24 +2023,13 @@ function renderHistoryChart(data, metric) {
     },
     yAxis: {
       type: 'value',
+      name: metric,
+      nameTextStyle: { color: '#64748b', fontSize: 10 },
       axisLine: { lineStyle: { color: '#1e2d42' } },
       axisLabel: { color: '#64748b', fontSize: 10, fontFamily: 'JetBrains Mono' },
       splitLine: { lineStyle: { color: '#1e2d42', type: 'dashed' } },
     },
-    series: [{
-      name: metric,
-      type: 'line',
-      smooth: true,
-      symbol: 'none',
-      lineStyle: { width: 2, color: '#3b82f6' },
-      areaStyle: {
-        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-          { offset: 0, color: 'rgba(59,130,246,0.3)' },
-          { offset: 1, color: 'rgba(59,130,246,0.02)' },
-        ]),
-      },
-      data: points,
-    }],
+    series,
     dataZoom: [
       { type: 'inside', start: 0, end: 100 },
       { type: 'slider', start: 0, end: 100, height: 20, bottom: 5,
@@ -2056,6 +2078,11 @@ function renderHistoryTable(data) {
   `).join('');
 }
 
+function escapeCsvValue(value) {
+  const text = String(value ?? '');
+  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
 function exportHistory() {
   if (!state.historyData?.data?.length) {
     showToast('无数据可导出', 'error');
@@ -2063,7 +2090,12 @@ function exportHistory() {
   }
   const rows = [['timestamp', 'value', 'source', 'tags']];
   state.historyData.data.forEach(p => {
-    rows.push([new Date(p.t * 1000).toISOString(), p.v, p.src || '', JSON.stringify(p.tags || {})]);
+    rows.push([
+      new Date(p.t * 1000).toISOString(),
+      p.v,
+      p.src || '',
+      JSON.stringify(p.tags || {})
+    ].map(escapeCsvValue));
   });
   const csv = rows.map(r => r.join(',')).join('\n');
   const blob = new Blob([csv], { type: 'text/csv' });

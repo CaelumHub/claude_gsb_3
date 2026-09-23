@@ -64,6 +64,70 @@ class TimeSeriesStorage:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
+    @staticmethod
+    def _normalize_tags(tags: Optional[Dict[str, Any]]) -> Dict[str, str]:
+        """Normalize tags so different tag orders represent the same series."""
+        if not isinstance(tags, dict):
+            return {}
+        return {
+            str(key): str(value)
+            for key, value in tags.items()
+            if value is not None
+        }
+
+    @classmethod
+    def _series_key(cls, point: Dict[str, Any]) -> Tuple[Any, ...]:
+        """Return the identity of a series (source + tags)."""
+        tags = cls._normalize_tags(point.get("tags", {}))
+        tag_key = json.dumps(tags, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False)
+        return (str(point.get("src", "default")), tag_key)
+
+    @classmethod
+    def _point_identity(cls, point: Dict[str, Any]) -> Tuple[Any, ...]:
+        """Return the identity of one sample in a series."""
+        return (point["t"],) + cls._series_key(point)
+
+    @classmethod
+    def _deduplicate_points(cls, points: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Deduplicate exact samples from the same series.
+
+        Points with the same timestamp but different sources or tags belong to
+        different series and must all be retained. Repeated writes to the same
+        series and timestamp are treated as an update (last write wins).
+        """
+        latest_by_identity: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        for point in points:
+            point = dict(point)
+            point["tags"] = cls._normalize_tags(point.get("tags", {}))
+            point.setdefault("src", "default")
+            latest_by_identity[cls._point_identity(point)] = point
+
+        return sorted(
+            latest_by_identity.values(),
+            key=lambda p: (p["t"], str(p.get("src", "default")),
+                           json.dumps(p.get("tags", {}), sort_keys=True,
+                                      separators=(",", ":"), ensure_ascii=False))
+        )
+
+    @staticmethod
+    def _limit_points_by_timestamp(points: List[Dict[str, Any]],
+                                   max_points: int) -> List[Dict[str, Any]]:
+        """
+        Select timestamps without splitting series that share a timestamp.
+
+        A point limit is applied to distinct timestamps; every source/tag value
+        at a selected timestamp is kept.
+        """
+        if max_points is None or max_points <= 0 or len(points) <= max_points:
+            return points
+
+        timestamps = sorted({point["t"] for point in points})
+        step = len(timestamps) / max_points
+        selected = {timestamps[int(i * step)] for i in range(max_points)}
+        return [point for point in points if point["t"] in selected]
+
     def _get_shard_path(self, metric: str, timestamp: float) -> str:
         """Get the hourly shard file path for a metric and timestamp."""
         dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
@@ -79,10 +143,11 @@ class TimeSeriesStorage:
     def write(self, metric: str, timestamp: float, value: float,
               tags: Optional[Dict[str, str]] = None, source: str = "default"):
         """Write a single data point to the write buffer."""
+        tags = self._normalize_tags(tags)
         point = {
             "t": round(timestamp, 3),
             "v": value,
-            "tags": tags or {},
+            "tags": tags,
             "src": source
         }
 
@@ -108,7 +173,7 @@ class TimeSeriesStorage:
                 point = {
                     "t": round(p.get("timestamp", time.time()), 3),
                     "v": p.get("value", 0),
-                    "tags": p.get("tags", {}),
+                    "tags": self._normalize_tags(p.get("tags", {})),
                     "src": p.get("source", "default")
                 }
                 self._write_buffer[metric].append(point)
@@ -141,21 +206,15 @@ class TimeSeriesStorage:
                     existing = []
 
             existing.extend(points)
-            # Sort by timestamp and deduplicate
-            existing.sort(key=lambda x: x["t"])
-            # Remove exact duplicates
-            seen = set()
-            unique = []
-            for p in existing:
-                key = (p["t"], p["v"])
-                if key not in seen:
-                    seen.add(key)
-                    unique.append(p)
-            existing = unique
+            existing = self._deduplicate_points(existing)
 
-            # Keep only last 10000 points per shard to prevent unbounded growth
+            # Keep only the latest 10000 samples per shard to prevent
+            # unbounded growth.  Trimming by timestamp avoids dropping one
+            # source/tag value while keeping another at the same instant.
             if len(existing) > 10000:
-                existing = existing[-10000:]
+                boundary_index = max(0, len(existing) - 10000)
+                boundary_time = existing[boundary_index]["t"]
+                existing = [p for p in existing if p["t"] >= boundary_time]
 
             try:
                 tmp_path = shard_path + ".tmp"
@@ -211,21 +270,11 @@ class TimeSeriesStorage:
                                  if all(p.get("tags", {}).get(k) == v for k, v in tags.items())]
             results.extend(cache_filtered)
 
-        # Deduplicate and sort
-        seen = set()
-        unique = []
-        for p in sorted(results, key=lambda x: x["t"]):
-            key = (p["t"], p["v"])
-            if key not in seen:
-                seen.add(key)
-                unique.append(p)
+        # Deduplicate exact writes.  Different sources/tags at the same
+        # timestamp are different series and remain separate data points.
+        unique = self._deduplicate_points(results)
 
-        # Downsample if too many points
-        if len(unique) > max_points:
-            step = len(unique) / max_points
-            unique = [unique[int(i * step)] for i in range(max_points)]
-
-        return unique
+        return self._limit_points_by_timestamp(unique, max_points)
 
     def get_metrics(self) -> List[str]:
         """Get list of all available metrics."""
