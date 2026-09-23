@@ -175,6 +175,60 @@ def lttb_downsample_adaptive(data: List[Dict], target_points: int,
     return sampled
 
 
+def _series_key(point: Dict):
+    """
+    Identity of the series a point belongs to (everything except time/value).
+
+    Points with the same timestamp but different sources or tags are
+    different observations and must never be downsampled away against each
+    other, so each series is reduced independently.
+    """
+    tags = point.get("tags") or {}
+    return (
+        point.get("src", "default"),
+        tuple(sorted((str(k), str(v)) for k, v in tags.items()))
+    )
+
+
+def downsample_grouped(data: List[Dict], target_points: int,
+                       method: str = "lttb") -> List[Dict]:
+    """
+    Downsample while preserving every (source, tags) series.
+
+    Points from different sources or with different tags are grouped first,
+    each group is downsampled independently with a proportional point budget,
+    and the results are merged back in timestamp order. This guarantees that
+    no series disappears simply because another series shares its timestamps.
+    """
+    if not data or target_points <= 0:
+        return []
+
+    groups: Dict = {}
+    order = []
+    for p in data:
+        key = _series_key(p)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(p)
+
+    # Single series (or already small enough): behave exactly as before
+    if len(groups) == 1:
+        return downsample_simple(data, target_points, method)
+
+    total = len(data)
+    result: List[Dict] = []
+    for key in order:
+        group = sorted(groups[key], key=lambda x: x["t"])
+        # Proportional budget, at least 2 points (first/last) per series
+        budget = max(2, round(target_points * len(group) / total))
+        budget = min(budget, len(group))
+        result.extend(downsample_simple(group, budget, method))
+
+    result.sort(key=lambda x: x["t"])
+    return result
+
+
 def downsample_simple(data: List[Dict], target_points: int,
                       method: str = "lttb") -> List[Dict]:
     """

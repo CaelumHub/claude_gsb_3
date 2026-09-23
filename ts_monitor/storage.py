@@ -64,6 +64,45 @@ class TimeSeriesStorage:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
+    @staticmethod
+    def _point_identity(point: Dict) -> Tuple:
+        """
+        Identity of a data point for deduplication.
+
+        Points sharing the same timestamp but coming from different sources
+        or carrying different tags are distinct observations and must all be
+        retained. Only true repeats (same time + source + tags) collapse.
+        Tags are compared by their sorted key/value pairs so dict ordering
+        does not matter.
+        """
+        tags = point.get("tags") or {}
+        tag_key = tuple(sorted((str(k), str(v)) for k, v in tags.items()))
+        return (point["t"], point.get("src", "default"), tag_key)
+
+    @staticmethod
+    def _series_key(point: Dict) -> Tuple:
+        """
+        Identity of the series a point belongs to (source + tags, no time).
+
+        Used to keep observations of different sources/tag sets in separate
+        groups when thinning or downsampling.
+        """
+        tags = point.get("tags") or {}
+        tag_key = tuple(sorted((str(k), str(v)) for k, v in tags.items()))
+        return (point.get("src", "default"), tag_key)
+
+    @staticmethod
+    def _deduplicate_points(points: List[Dict]) -> List[Dict]:
+        """
+        Remove duplicate points by (timestamp, source, tags), keeping the
+        last occurrence for each identity (latest write wins on re-push),
+        and return them sorted by timestamp.
+        """
+        latest: Dict[Tuple, Dict] = {}
+        for p in points:
+            latest[TimeSeriesStorage._point_identity(p)] = p
+        return sorted(latest.values(), key=lambda x: x["t"])
+
     def _get_shard_path(self, metric: str, timestamp: float) -> str:
         """Get the hourly shard file path for a metric and timestamp."""
         dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
@@ -141,17 +180,12 @@ class TimeSeriesStorage:
                     existing = []
 
             existing.extend(points)
-            # Sort by timestamp and deduplicate
-            existing.sort(key=lambda x: x["t"])
-            # Remove exact duplicates
-            seen = set()
-            unique = []
-            for p in existing:
-                key = (p["t"], p["v"])
-                if key not in seen:
-                    seen.add(key)
-                    unique.append(p)
-            existing = unique
+            # Sort by timestamp and deduplicate.
+            # Identity is (timestamp, source, tags): points with the same
+            # timestamp from different sources or with different tags are
+            # separate observations and are all kept. Only exact re-pushes
+            # of the same series collapse (latest write wins).
+            existing = self._deduplicate_points(existing)
 
             # Keep only last 10000 points per shard to prevent unbounded growth
             if len(existing) > 10000:
@@ -211,19 +245,33 @@ class TimeSeriesStorage:
                                  if all(p.get("tags", {}).get(k) == v for k, v in tags.items())]
             results.extend(cache_filtered)
 
-        # Deduplicate and sort
-        seen = set()
-        unique = []
-        for p in sorted(results, key=lambda x: x["t"]):
-            key = (p["t"], p["v"])
-            if key not in seen:
-                seen.add(key)
-                unique.append(p)
+        # Deduplicate (shard data and cache can overlap) and sort.
+        # Identity is (timestamp, source, tags) so observations from
+        # different sources / tag sets at the same timestamp are all kept.
+        unique = self._deduplicate_points(results)
 
-        # Downsample if too many points
+        # Thin out if too many points. Sample each (source, tags) series
+        # independently so a cap can never drop an entire series.
         if len(unique) > max_points:
-            step = len(unique) / max_points
-            unique = [unique[int(i * step)] for i in range(max_points)]
+            groups: Dict[Tuple, List[Dict]] = defaultdict(list)
+            order: List[Tuple] = []
+            for p in unique:
+                key = self._series_key(p)
+                if key not in groups:
+                    order.append(key)
+                groups[key].append(p)
+
+            total = len(unique)
+            thinned: List[Dict] = []
+            for key in order:
+                group = groups[key]
+                budget = min(len(group), max(1, round(max_points * len(group) / total)))
+                if budget == len(group):
+                    thinned.extend(group)
+                else:
+                    step = len(group) / budget
+                    thinned.extend(group[int(i * step)] for i in range(budget))
+            unique = self._deduplicate_points(thinned)
 
         return unique
 

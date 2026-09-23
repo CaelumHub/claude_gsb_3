@@ -18,7 +18,7 @@ from typing import Dict, Any, Optional
 
 from storage import TimeSeriesStorage
 from anomaly import AnomalyDetector
-from downsample import downsample_simple
+from downsample import downsample_grouped
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -288,7 +288,7 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
             return
 
         data = self.storage.query(metric, start, end, max_points=50000)
-        downsampled = downsample_simple(data, target, method)
+        downsampled = downsample_grouped(data, target, method)
 
         self._send_json({
             "metric": metric,

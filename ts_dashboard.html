@@ -1967,7 +1967,32 @@ async function queryHistory() {
 function renderHistoryChart(data, metric) {
   if (!historyChartInstance) return;
 
-  const points = (data.data || []).map(p => [p.t * 1000, p.v]);
+  // Group points by series identity (source + tags). Observations sharing a
+  // timestamp but coming from different sources / tags are kept as separate
+  // series instead of overwriting each other on one line.
+  const groups = new Map();
+  (data.data || []).forEach(p => {
+    const tagStr = Object.entries(p.tags || {})
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([k, v]) => `${k}=${v}`).join(',');
+    const key = `${p.src || 'default'}${tagStr ? ` | ${tagStr}` : ''}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push([p.t * 1000, p.v]);
+  });
+
+  const palette = ['#3b82f6', '#22c55e', '#f59e0b', '#ef4444', '#a855f7',
+                   '#06b6d4', '#ec4899', '#84cc16', '#f97316', '#6366f1'];
+  const seriesNames = [...groups.keys()];
+  const series = seriesNames.map((name, i) => ({
+    name,
+    type: 'line',
+    smooth: true,
+    symbol: 'none',
+    lineStyle: { width: 2, color: palette[i % palette.length] },
+    itemStyle: { color: palette[i % palette.length] },
+    data: groups.get(name),
+    connectNulls: false,
+  }));
 
   historyChartInstance.setOption({
     tooltip: {
@@ -1977,11 +2002,12 @@ function renderHistoryChart(data, metric) {
       textStyle: { color: '#e2e8f0', fontSize: 11, fontFamily: 'JetBrains Mono' },
     },
     legend: {
-      data: [metric],
+      type: 'scroll',
+      data: seriesNames,
       top: 0,
       textStyle: { color: '#94a3b8', fontSize: 11, fontFamily: 'JetBrains Mono' },
     },
-    grid: { left: 50, right: 20, top: 30, bottom: 30 },
+    grid: { left: 50, right: 20, top: 40, bottom: 30 },
     xAxis: {
       type: 'time',
       axisLine: { lineStyle: { color: '#1e2d42' } },
@@ -1994,20 +2020,7 @@ function renderHistoryChart(data, metric) {
       axisLabel: { color: '#64748b', fontSize: 10, fontFamily: 'JetBrains Mono' },
       splitLine: { lineStyle: { color: '#1e2d42', type: 'dashed' } },
     },
-    series: [{
-      name: metric,
-      type: 'line',
-      smooth: true,
-      symbol: 'none',
-      lineStyle: { width: 2, color: '#3b82f6' },
-      areaStyle: {
-        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-          { offset: 0, color: 'rgba(59,130,246,0.3)' },
-          { offset: 1, color: 'rgba(59,130,246,0.02)' },
-        ]),
-      },
-      data: points,
-    }],
+    series,
     dataZoom: [
       { type: 'inside', start: 0, end: 100 },
       { type: 'slider', start: 0, end: 100, height: 20, bottom: 5,
